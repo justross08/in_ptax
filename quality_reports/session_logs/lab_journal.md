@@ -279,3 +279,20 @@ Takes the output of `district_tax_rates()` (the crosswalk with the five rate col
 - By-group: `CNTY_CD`, `TAX_DIST_CD`, `TAX_DIST_NAME` (TAX_DIST_NAME included since it is 1:1 and useful for joins/display)
 - Output sorted by `CNTY_CD` then `TAX_DIST_CD`
 - The `CERTD_TAX_RATE_PCNT` total in the output should equal `LocalTaxRate` in TAXDATA (after the 2.4-format implied decimal is applied at import) for parcels in the same district
+
+---
+
+## 2026-03-01 — Session 9: First push to GitHub
+
+### Actions
+
+- Copied all working R functions from `PTCAPS/code/` to `in_ptax/R/`:
+  `read_taxdata.R`, `read_adjust.R`, `PTBill.R`, `MaxTaxBill.R`, `sb1_supp.R`,
+  `budget_tax_rates.R`, `district_tax_rates.R`, `district_rates.R`
+- README.md updated and synced to `in_ptax/README.md`:
+  - Fixed incorrect AdjstCode reference ("4" → "64" for supplemental deduction)
+  - Added `CapExemptFunds.xlsx` to data sources table
+  - Updated R/ directory listing and added full function inventory
+  - Added Tax districts concept explanation
+- CLAUDE.md status section updated to reflect current state
+- Committed and pushed to `origin/main`
