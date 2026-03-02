@@ -296,3 +296,122 @@ Takes the output of `district_tax_rates()` (the crosswalk with the five rate col
   - Added Tax districts concept explanation
 - CLAUDE.md status section updated to reflect current state
 - Committed and pushed to `origin/main`
+
+---
+
+## 2026-03-01 — Session 10: netav_taxbill()
+
+### What was built
+
+`netav_taxbill.R` written to `PTCAPS/code/`. Function signature:
+
+```r
+netav_taxbill(TAXDATA, ADJMENTS)
+```
+
+Returns a parcel-level data frame (`NETAV`) with one row per parcel in TAXDATA containing GrossAV, aggregated credits and deductions from ADJMENTS, and computed NetAV.
+
+### Design decisions
+
+**Circuit-breaker credits zeroed before aggregation:** AdjstCodes "61", "62", "63" are set to zero before the credit aggregation step. These are cap credits that the downstream cap-application functions will recalculate; including the existing values would double-count them.
+
+**AdjstTypeCode "E" (exemptions) excluded:** Exemptions reduce assessed value through a separate administrative process and are not summed into TotalCredits or TotalDeductions. Only types "C" and "D" are aggregated.
+
+**TAXDATA as parcel universe:** Left-join from TAXDATA — parcels in ADJMENTS but absent from TAXDATA are dropped. Parcels in TAXDATA with no ADJMENTS rows receive TotalCredits = 0 and TotalDeductions = 0.
+
+**NetAV = GrossAV − TotalDeductions.** Credits do not reduce AV; they reduce the tax bill directly and are carried forward for use in the bill calculation step.
+
+### Output columns
+
+| Column | Definition |
+|--------|-----------|
+| `ParcelNum` | Parcel identifier (from TAXDATA) |
+| `GrossAV` | Gross assessed value |
+| `TotalCredits` | Sum of non-circuit-breaker credit amounts (AdjstTypeCode "C", excl. codes 61–63) |
+| `TotalDeductions` | Sum of deduction amounts (AdjstTypeCode "D") |
+| `NetAV` | GrossAV − TotalDeductions |
+
+### Amendment: exemptions added to NetAV calculation
+
+Initial implementation only subtracted deductions (type "D") from GrossAV. Validation against TAXDATA revealed 563 mismatching parcels and a $91.4M aggregate gap. Diagnosis: all 818 exemption rows (AdjstTypeCode "E") in Adams County belong to those 563 parcels, and their TotalAdjustAmount sums to exactly the gap. Exemptions reduce assessed value in the same way as deductions and must be included.
+
+**Fix applied:** Added `TotalExemptions` column (type "E" aggregate) and updated:
+- `NetAV = GrossAV − TotalDeductions − TotalExemptions`
+
+### Validation on Adams County (post-fix)
+
+- 23,140 parcels; exact NetAV match on all 23,139 non-NA parcels
+- 0 mismatches; aggregate totals identical: sum(GrossAV) = $3.31B, sum(NetAV) = $2.14B
+- 1 parcel with NA GrossAV in TAXDATA — NetAV also NA, expected
+
+### Output columns (final)
+
+| Column | Definition |
+|--------|-----------|
+| `ParcelNum` | Parcel identifier (from TAXDATA) |
+| `StateDistrict` | State tax district code; identifies the county |
+| `GrossAV` | Gross assessed value |
+| `TotalCredits` | Sum of type "C" adjustments, excluding circuit-breaker codes 61–63 |
+| `TotalDeductions` | Sum of type "D" adjustments |
+| `TotalExemptions` | Sum of type "E" adjustments |
+| `NetAV` | GrossAV − TotalDeductions − TotalExemptions |
+
+---
+
+## 2026-03-01 — Session 11: fiscal_analysis()
+
+### What was built
+
+`fiscal_analysis.R` written to `PTCAPS/code/`. Function signature:
+
+```r
+fiscal_analysis(county, assessment_year, TAXDATA, ADJMENTS,
+                BUDGETDATA, xwalk, FRF, CapExempt)
+```
+
+Returns a named list with three output data frames.
+
+### Inputs
+
+| Argument | Description |
+|----------|-------------|
+| `county` | County code (integer or character; "01" or 1 for Adams; 0 = all) |
+| `assessment_year` | Assessment year (pay year − 1); governs SuppHTRC |
+| `TAXDATA` | From read_taxdata() |
+| `ADJMENTS` | From read_adjust() |
+| `BUDGETDATA` | From read_excel() on budget levy file |
+| `xwalk` | From read_excel() on rate crosswalk |
+| `FRF` | Fixed-rate fund list |
+| `CapExempt` | Cap-exempt fund list (caller pre-filters to active post-2021 funds) |
+
+Note: `FRF` and `CapExempt` are required arguments not listed in the original spec; they are needed by `budget_tax_rates()` and `district_tax_rates()`.
+
+### Outputs
+
+| Name | Level | Key columns |
+|------|-------|-------------|
+| `out.TAXDATA` | Parcel | All TAXDATA fields + NetAV, MaxTaxBill, GrossTaxBill, NonExemptGrossBill, ExemptGrossBill, NetBill, PTCLoss, SuppHTRC, ActualNonExemptBill, ActualBill |
+| `out.BUDGETDATA` | District × unit × fund | Recalculated Certified Levy, rate components, sum_ bill aggregates, shr_ rate shares, Revenue, Unfunded |
+| `out.LocalFisc` | County × unit | Revenue, Unfunded |
+
+### Pipeline (9 steps)
+
+1. **netav_taxbill** → NETAV (parcel NetAV and adjustment totals)
+2. **district_tax_rates** → DISTRICTRATES_f (xwalk with fund flags and FixedRate; drop CERTD_TAX_RATE_PCNT, ResidRate, ExemptRate, NonExemptRate)
+3. Aggregate NETAV by StateDistrict → aggNV ("Certified Net Assessed Valuation")
+4. Merge aggNV onto DISTRICTRATES_f by TAX_DIST_CD → NewAV_by_fund
+5. **budget_tax_rates** → BUDGETRATES; add OtherRev, ResidLevy; drop rate/classification columns → BUDGETDATA2
+6. Merge NewAV_by_fund onto BUDGETDATA2 (by CNTY_CD/County, UNIT_CD/Unit Code, FUND_CD/Fund) → LocalFisc_Fund; recalculate Certified Levy, ResidRate, ExemptRate, NonExemptRate, CGR from new NAV
+7. Build TAXDATA2; merge NETAV columns and MaxTaxBill; join district composite rates; compute 8 bill variables → out.TAXDATA + aggTaxBills (sum. prefix)
+8. Aggregate rates by TAX_DIST_CD + ExemptFund (sum_ prefix); merge back; compute shr_ shares → LocalFisc_Fund2
+9. Merge aggTaxBills onto LocalFisc_Fund2; compute Revenue and Unfunded → out.BUDGETDATA; aggregate by CNTY_CD + UNIT_CD → out.LocalFisc
+
+### Key design notes
+
+**Column name mismatch at step 6 merge:** BUDGETDATA uses `County`, `Unit Code`, `Fund`; xwalk uses `CNTY_CD`, `UNIT_CD`, `FUND_CD`. Handled via by.x/by.y in merge(). Result keeps xwalk column names.
+
+**Certified Gross Tax Rate formula:** CGR = ResidRate + FixedRate. ResidFund and RateFund are mutually exclusive (ResidFund = 1 − RateFund), so exactly one term is non-zero per fund and the sum equals the total fund rate without double-counting. ExemptRate and NonExemptRate partition this total for cap analysis and revenue allocation but are not included in CGR.
+
+**SuppHTRC:** pmax(300, 0.10 × NetBill) applied to all parcels when assessment_year ≥ 2025. No homestead filter in spec; applied universally as written.
+
+**NAV = 0 guard:** safe_rate = 0 when NAV is 0 or NA to prevent Inf/NaN in rate calculations.
