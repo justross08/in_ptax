@@ -1,6 +1,6 @@
 # sb1_supp.R
 #
-# Applies two SB 1 (2025) policy changes to ADJMENTS:
+# Applies three SB 1 (2025) policy changes to ADJMENTS:
 #
 #   1. HOMESTEAD DEDUCTION PHASE-IN (assessment years 2025–2030+)
 #      Revises TotalAdjustAmount for AdjstCode "3" (standard deduction) and
@@ -11,6 +11,14 @@
 #      tax credits used for property tax replacement). These credits are fully
 #      eliminated starting in assessment year 2027.
 #
+#   3. DEDUCTION-TO-CREDIT RECLASSIFICATION (assessment years 2025+)
+#      Converts certain AdjstTypeCode "D" rows to "C" and sets a fixed
+#      statutory credit amount:
+#        AdjstCode "4"      — Senior:                  $150
+#        AdjstCode "5","6"  — Blind / Disabled:         $125
+#        AdjstCode "7","8"  — Veteran with disability:  $250
+#        AdjstCode "9","10" — Other veteran:            $200
+#
 # INPUTS
 #   assessment_year  Numeric. Assessment year for which to apply policy changes.
 #   TAXDATA          Data frame from read_taxdata(). Must contain ParcelNum and GrossAV.
@@ -20,9 +28,11 @@
 #                      AdjstCode "64"   — supplemental deduction (2025+)
 #                      AdjstCodes 57–60 — income tax relief credits (zeroed 2027+)
 #                      AdjstCodes 77–83 — additional LOIT relief credits (zeroed 2027+)
+#                      AdjstCodes 4–10  — reclassified D→C with fixed amounts (2025+)
 #
 # OUTPUT
-#   A copy of ADJMENTS with TotalAdjustAmount revised for affected rows.
+#   A copy of ADJMENTS with TotalAdjustAmount revised for affected rows and,
+#   for AdjstCodes 4–10, AdjstTypeCode changed from "D" to "C".
 #   All other rows are returned unchanged.
 #
 # NOTES
@@ -170,6 +180,25 @@ sb1_supp <- function(assessment_year, TAXDATA, ADJMENTS) {
     if (length(idx_loit) > 0) {
       ADJMENTS_out$TotalAdjustAmount[idx_loit] <- 0
     }
+  }
+
+  # ── Reclassify deductions as fixed-amount credits (assessment_year >= 2025) ─
+  # AdjstTypeCode changed from "D" to "C"; TotalAdjustAmount set to statutory amount.
+  deduction_credit_map <- c(
+    "4"  = 150,   # Senior
+    "5"  = 125,   # Blind
+    "6"  = 125,   # Disabled
+    "7"  = 250,   # Veteran with disability
+    "8"  = 250,   # Veteran with disability
+    "9"  = 200,   # Other veteran
+    "10" = 200    # Other veteran
+  )
+  dc_codes <- names(deduction_credit_map)
+  is_dc    <- adj_code %in% dc_codes
+  idx_dc   <- which(is_dc)
+  if (length(idx_dc) > 0) {
+    ADJMENTS_out$AdjstTypeCode[idx_dc]     <- "C"
+    ADJMENTS_out$TotalAdjustAmount[idx_dc] <- deduction_credit_map[adj_code[idx_dc]]
   }
 
   ADJMENTS_out

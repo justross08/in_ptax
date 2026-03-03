@@ -415,3 +415,41 @@ Note: `FRF` and `CapExempt` are required arguments not listed in the original sp
 **SuppHTRC:** pmax(300, 0.10 × NetBill) applied to all parcels when assessment_year ≥ 2025. No homestead filter in spec; applied universally as written.
 
 **NAV = 0 guard:** safe_rate = 0 when NAV is 0 or NA to prevent Inf/NaN in rate calculations.
+
+---
+
+## 2026-03-02 — Session 12: sb1_supp() policy change 3; fiscal_analysis() first run
+
+### What was built / changed
+
+**`sb1_supp.R` — policy change 3 added:** Certain AdjstTypeCode "D" rows are reclassified to type "C" and assigned fixed statutory credit amounts for assessment_year ≥ 2025. Applies to:
+
+| AdjstCode | Description | Credit Amount |
+|-----------|-------------|---------------|
+| "4" | Senior | $150 |
+| "5", "6" | Blind / Disabled | $125 |
+| "7", "8" | Veteran with disability | $250 |
+| "9", "10" | Other veteran | $200 |
+
+Implementation: `deduction_credit_map` named vector keyed by AdjstCode; rows identified via `adj_code %in% dc_codes`; `AdjstTypeCode` and `TotalAdjustAmount` updated in place on `ADJMENTS_out`. `adj_code` is computed from the original ADJMENTS before any mutations, so indexing is correct. The block runs unconditionally within the function (which already guards on assessment_year ≥ 2025 at entry).
+
+Because these rows move from type "D" to type "C", they shift from reducing NetAV (via `netav_taxbill` deduction aggregation) to reducing the final tax bill (via `TotalCredits`). This is the intended behavioral change.
+
+### fiscal_analysis() first run — open issue
+
+First Adams County test run completed. Preliminary observation: **district composite rates in `out.TAXDATA` appear too large** — the `Certified Gross Tax Rate` column on parcels looks implausibly high.
+
+Two hypotheses:
+
+1. **Scaling inconsistency** — `CERTD_TAX_RATE_PCNT` in the crosswalk is in $/100 AV, and `LocalTaxRate` in TAXDATA is also in $/100 AV after the 2.4-format implied decimal at import. These should be directly comparable. If one source was not scaled correctly, district totals would be off by a factor of 10,000 or 100.
+
+2. **Aggregation scope too broad** — in `fiscal_analysis()` step 7, `dist_comp` is built by summing `LocalFisc_Fund` rate columns by `TAX_DIST_CD`. If `LocalFisc_Fund` erroneously contains rows from multiple districts (e.g., from a cross-join artifact in step 6), rates would be over-summed.
+
+### Next session
+
+Run the **Fiscal Analysis block in `Test.R`** and investigate:
+
+- Print `dist_comp` for Adams County district "001" and compare `Certified Gross Tax Rate` to the known value (~1.68 $/100 AV from `district_rates()` output)
+- Check `nrow(LocalFisc_Fund)` against `nrow(xwalk)` — they should be equal (step 6 is an inner join on county × unit × fund)
+- Verify `CERTD_TAX_RATE_PCNT` range in the filtered xwalk before and after `district_tax_rates()`
+- If rates are correct at the fund level but too large after summing, the join in step 6 is likely producing duplicate rows

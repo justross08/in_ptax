@@ -36,7 +36,9 @@ in_ptax/
 │   ├── sb1_supp.R                  # SB 1 (2025): homestead phase-in + LOIT credit elimination
 │   ├── budget_tax_rates.R          # Fund classification for aggregate budget levy file
 │   ├── district_tax_rates.R        # Fund classification for district/unit crosswalk
-│   └── district_rates.R            # District-level composite rates (aggregates crosswalk)
+│   ├── district_rates.R            # District-level composite rates (aggregates crosswalk)
+│   ├── netav_taxbill.R             # Parcel-level NetAV from TAXDATA + ADJMENTS
+│   └── fiscal_analysis.R           # Workhorse simulation: bills, revenue allocation, unit summary
 ├── analysis/                       # Runnable scripts (baseline, validation, policy sims)
 ├── docs/                           # Reference documents and data layout notes
 └── quality_reports/
@@ -62,9 +64,14 @@ in_ptax/
 - **`district_tax_rates(xwalk, FRF, CapExempt)`** — same classification applied to the district/unit/fund crosswalk. Fund code column is `FUND_CD`; rate column is `CERTD_TAX_RATE_PCNT` ($/100 AV).
 - **`district_rates(xwalk)`** — takes output of `district_tax_rates()` and sums the five rate columns across all unit×fund rows within each `CNTY_CD` + `TAX_DIST_CD`, yielding one composite rate row per tax district.
 
+### Simulation pipeline
+
+- **`netav_taxbill(TAXDATA, ADJMENTS)`** — computes parcel-level net assessed value from TAXDATA and ADJMENTS. Zeros circuit-breaker credits (AdjstCodes 61–63), aggregates type C credits, type D deductions, and type E exemptions by parcel. Returns `ParcelNum`, `StateDistrict`, `GrossAV`, `TotalCredits`, `TotalDeductions`, `TotalExemptions`, `NetAV` (= GrossAV − deductions − exemptions).
+- **`fiscal_analysis(county, assessment_year, TAXDATA, ADJMENTS, BUDGETDATA, xwalk, FRF, CapExempt)`** — workhorse simulation function. Returns a named list: `out.TAXDATA` (parcel-level bills including GrossTaxBill, NetBill, PTCLoss, SuppHTRC, ActualBill), `out.BUDGETDATA` (fund-level revenue allocation), `out.LocalFisc` (unit-level Revenue and Unfunded summary). Use `county = 0` for all counties.
+
 ### Policy simulation
 
-- **`sb1_supp(assessment_year, TAXDATA, ADJMENTS)`** — applies two SB 1 (2025) policy changes to ADJMENTS: (1) phases in a revised homestead deduction schedule for AdjstCodes "3" and "64" over 2025–2030+; (2) zeros out local income tax credits (AdjstCodes 57–60, 77–83) starting in assessment year 2027.
+- **`sb1_supp(assessment_year, TAXDATA, ADJMENTS)`** — applies three SB 1 (2025) policy changes to ADJMENTS: (1) phases in a revised homestead deduction schedule for AdjstCodes "3" and "64" over 2025–2030+; (2) zeros out local income tax credits (AdjstCodes 57–60, 77–83) starting in assessment year 2027; (3) reclassifies AdjstCodes 4–10 from type "D" (deduction) to type "C" (credit) with fixed statutory amounts ($150 senior, $125 blind/disabled, $250 veteran with disability, $200 other veteran).
 
 ## Key Concepts
 
