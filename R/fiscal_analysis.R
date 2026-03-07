@@ -39,7 +39,15 @@
 #                  classification flags, recalculated levies and rates based
 #                  on new NAV, district bill aggregates, fund revenue shares,
 #                  Revenue, and Unfunded (for non-exempt funds only).
-#   out.LocalFisc  Unit-level summary: CNTY_CD, UNIT_CD, Revenue, Unfunded.
+#   out.LocalFisc  Unit-level summary: CNTY_CD, UNIT_TYPE_CD, UNIT_CD,
+#                  Revenue, Unfunded.
+#   out.UnitFund   Unit × fund validation table. One row per
+#                  CNTY_CD × UNIT_TYPE_CD × UNIT_CD × FUND_CD. Contains
+#                  computed values (Comp_CNAV, Comp_CGR, Comp_Levy,
+#                  Comp_Revenue, Comp_Unfunded) alongside the submitted
+#                  input values (Sub_CNAV, Sub_CGR, Sub_Levy) for
+#                  side-by-side comparison. Also carries UNIT_NAME and
+#                  FUND_LONG_NAME from the crosswalk for readability.
 #
 # HELPER FUNCTIONS USED
 #   netav_taxbill, budget_tax_rates, district_tax_rates, MaxTaxBill
@@ -87,18 +95,32 @@ fiscal_analysis <- function(county, assessment_year,
   drop_drf <- c("CERTD_TAX_RATE_PCNT", "ResidRate", "ExemptRate", "NonExemptRate")
   DISTRICTRATES_f <- DISTRICTRATES_f[, !names(DISTRICTRATES_f) %in% drop_drf]
 
-  # ── Step 3: aggNV ──────────────────────────────────────────────────────────
-  # Sum parcel NetAV to the district level. The result is the new Certified
-  # Net Assessed Valuation used to recompute tax rates in step 6.
-  aggNV <- aggregate(NetAV ~ StateDistrict, data = NETAV, FUN = sum, na.rm = TRUE)
-  names(aggNV)[names(aggNV) == "NetAV"] <- "Certified Net Assessed Valuation"
+  # ── Step 3: unit_NAV ───────────────────────────────────────────────────────
+  # Sum parcel NetAV to the unit level. Each parcel belongs to one district;
+  # each district overlaps multiple units. Expand via the xwalk (deduplicated
+  # to district × unit) to assign parcels to their units, then aggregate by
+  # CNTY_CD + UNIT_TYPE_CD + UNIT_CD. This is the correct denominator for the
+  # rate formula (levy / unit_NAV), since certified levies in BUDGETDATA are
+  # unit-totals, not district-level amounts.
+  dist_unit_map <- unique(xwalk[, c("CNTY_CD", "UNIT_TYPE_CD", "TAX_DIST_CD", "UNIT_CD")])
+  netav_by_unit <- merge(
+    NETAV[, c("StateDistrict", "NetAV")],
+    dist_unit_map,
+    by.x = "StateDistrict", by.y = "TAX_DIST_CD",
+    all.x = FALSE
+  )
+  unit_NAV <- aggregate(NetAV ~ CNTY_CD + UNIT_TYPE_CD + UNIT_CD,
+                        data = netav_by_unit, FUN = sum, na.rm = TRUE)
+  names(unit_NAV)[names(unit_NAV) == "NetAV"] <- "Certified Net Assessed Valuation"
 
   # ── Step 4: NewAV_by_fund ──────────────────────────────────────────────────
-  # Attach new district NAV to every district × unit × fund row in the
-  # crosswalk. Result has one row per TAX_DIST_CD × UNIT_CD × FUND_CD.
+  # Attach new unit-level NAV to every district × unit × fund row in the
+  # crosswalk. Merge key is CNTY_CD + UNIT_TYPE_CD + UNIT_CD; TAX_DIST_CD is
+  # already in DISTRICTRATES_f and is preserved in the output.
+  # Result has one row per TAX_DIST_CD × UNIT_TYPE_CD × UNIT_CD × FUND_CD.
   NewAV_by_fund <- merge(
-    DISTRICTRATES_f, aggNV,
-    by.x = "TAX_DIST_CD", by.y = "StateDistrict",
+    DISTRICTRATES_f, unit_NAV,
+    by  = c("CNTY_CD", "UNIT_TYPE_CD", "UNIT_CD"),
     all.x = TRUE
   )
 
@@ -118,14 +140,16 @@ fiscal_analysis <- function(county, assessment_year,
   BUDGETDATA2 <- BUDGETRATES[, !names(BUDGETRATES) %in% drop_bgt]
 
   # ── Step 6: LocalFisc_Fund ─────────────────────────────────────────────────
-  # Merge district NAV and fund classifications onto budget levy data.
-  # NewAV_by_fund uses (CNTY_CD, UNIT_CD, FUND_CD); BUDGETDATA2 uses
-  # (County, "Unit Code", Fund) for the same concepts.
-  # Result: one row per TAX_DIST_CD × unit × fund.
+  # Merge unit NAV and fund classifications onto budget levy data.
+  # NewAV_by_fund uses (CNTY_CD, UNIT_TYPE_CD, UNIT_CD, FUND_CD); BUDGETDATA2
+  # uses (County, "Unit Type Code", "Unit Code", Fund) for the same concepts.
+  # UNIT_TYPE_CD is required to uniquely identify units within a county
+  # (UNIT_CD alone is not unique across unit types).
+  # Result: one row per TAX_DIST_CD × unit type × unit × fund.
   LocalFisc_Fund <- merge(
     NewAV_by_fund, BUDGETDATA2,
-    by.x = c("CNTY_CD", "UNIT_CD", "FUND_CD"),
-    by.y = c("County",  "Unit Code", "Fund"),
+    by.x = c("CNTY_CD", "UNIT_TYPE_CD", "UNIT_CD", "FUND_CD"),
+    by.y = c("County",  "Unit Type Code", "Unit Code", "Fund"),
     all.x = FALSE, all.y = FALSE
   )
 
@@ -141,8 +165,12 @@ fiscal_analysis <- function(county, assessment_year,
 
   # Recalculate rates ($/100 AV) from new levy and new NAV.
   # Guard against NAV = 0 or NA.
+  # Round to 4 decimal places ($/100 AV percent form) before any downstream
+  # use — bill calculation, rate component assignment, and district-level
+  # summation all use the rounded value.
   levy      <- LocalFisc_Fund$`Certified Levy`
   safe_rate <- ifelse(!is.na(NAV) & NAV > 0, levy / NAV * 100, 0)
+  safe_rate <- round(safe_rate, 4)
 
   LocalFisc_Fund$ResidRate     <- safe_rate * LocalFisc_Fund$ResidFund
   LocalFisc_Fund$ExemptRate    <- safe_rate * LocalFisc_Fund$ExemptFund
@@ -263,18 +291,73 @@ fiscal_analysis <- function(county, assessment_year,
     0
   )
 
-  # Unit-level summary: aggregate Revenue and Unfunded by county and unit.
+  # Unit-level summary: aggregate Revenue and Unfunded by county, unit type,
+  # and unit. UNIT_TYPE_CD is required because UNIT_CD is not unique within a
+  # county across unit types (e.g. a city and a library may share the same code).
   out.LocalFisc <- aggregate(
     out.BUDGETDATA[, c("Revenue", "Unfunded")],
-    by  = list(CNTY_CD = out.BUDGETDATA$CNTY_CD,
-               UNIT_CD = out.BUDGETDATA$UNIT_CD),
+    by  = list(CNTY_CD      = out.BUDGETDATA$CNTY_CD,
+               UNIT_TYPE_CD = out.BUDGETDATA$UNIT_TYPE_CD,
+               UNIT_CD      = out.BUDGETDATA$UNIT_CD),
     FUN = sum, na.rm = TRUE
+  )
+
+  # ── Step 10: out.UnitFund — unit × fund validation table ──────────────────
+  # Collapses out.BUDGETDATA from district × unit × fund to unit × fund and
+  # merges in the submitted input BUDGETDATA values for side-by-side comparison.
+  #
+  # Certified Net Assessed Valuation, Certified Gross Tax Rate, and Certified
+  # Levy are identical for all district rows of a given unit × fund (they are
+  # unit-level quantities); the first occurrence is used to deduplicate.
+  # Revenue and Unfunded vary by district and are summed to the unit × fund level.
+  # Submitted values from the input BUDGETDATA are attached with a Sub_ prefix.
+
+  uf_key <- c("CNTY_CD", "UNIT_TYPE_CD", "UNIT_CD", "FUND_CD")
+
+  uf_const_cols <- c(uf_key, "UNIT_NAME", "FUND_LONG_NAME",
+                     "Certified Net Assessed Valuation",
+                     "Certified Gross Tax Rate",
+                     "Certified Levy")
+  uf_const <- out.BUDGETDATA[!duplicated(out.BUDGETDATA[, uf_key]), uf_const_cols]
+  names(uf_const)[names(uf_const) == "Certified Net Assessed Valuation"] <- "Comp_CNAV"
+  names(uf_const)[names(uf_const) == "Certified Gross Tax Rate"]         <- "Comp_CGR"
+  names(uf_const)[names(uf_const) == "Certified Levy"]                   <- "Comp_Levy"
+
+  uf_sums <- aggregate(
+    out.BUDGETDATA[, c("Revenue", "Unfunded")],
+    by  = list(CNTY_CD      = out.BUDGETDATA$CNTY_CD,
+               UNIT_TYPE_CD = out.BUDGETDATA$UNIT_TYPE_CD,
+               UNIT_CD      = out.BUDGETDATA$UNIT_CD,
+               FUND_CD      = out.BUDGETDATA$FUND_CD),
+    FUN = sum, na.rm = TRUE
+  )
+  names(uf_sums)[names(uf_sums) == "Revenue"]  <- "Comp_Revenue"
+  names(uf_sums)[names(uf_sums) == "Unfunded"] <- "Comp_Unfunded"
+
+  out.UnitFund <- merge(uf_const, uf_sums, by = uf_key)
+
+  # Attach submitted BUDGETDATA values (county-filtered input, before processing).
+  sub_cols <- c("County", "Unit Type Code", "Unit Code", "Fund",
+                "Certified Net Assessed Valuation",
+                "Certified Gross Tax Rate",
+                "Certified Levy")
+  sub_vals <- BUDGETDATA[, sub_cols]
+  names(sub_vals)[names(sub_vals) == "Certified Net Assessed Valuation"] <- "Sub_CNAV"
+  names(sub_vals)[names(sub_vals) == "Certified Gross Tax Rate"]         <- "Sub_CGR"
+  names(sub_vals)[names(sub_vals) == "Certified Levy"]                   <- "Sub_Levy"
+
+  out.UnitFund <- merge(
+    out.UnitFund, sub_vals,
+    by.x = c("CNTY_CD", "UNIT_TYPE_CD", "UNIT_CD", "FUND_CD"),
+    by.y = c("County",  "Unit Type Code", "Unit Code", "Fund"),
+    all.x = TRUE
   )
 
   # ── Return ─────────────────────────────────────────────────────────────────
   list(
     out.TAXDATA    = out.TAXDATA,
     out.BUDGETDATA = out.BUDGETDATA,
-    out.LocalFisc  = out.LocalFisc
+    out.LocalFisc  = out.LocalFisc,
+    out.UnitFund   = out.UnitFund
   )
 }

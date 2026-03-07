@@ -453,3 +453,93 @@ Run the **Fiscal Analysis block in `Test.R`** and investigate:
 - Check `nrow(LocalFisc_Fund)` against `nrow(xwalk)` — they should be equal (step 6 is an inner join on county × unit × fund)
 - Verify `CERTD_TAX_RATE_PCNT` range in the filtered xwalk before and after `district_tax_rates()`
 - If rates are correct at the fund level but too large after summing, the join in step 6 is likely producing duplicate rows
+
+---
+
+## 2026-03-07 — Session 13: fiscal_analysis() rate bug fixed
+
+### Root causes identified and fixed
+
+Two bugs in `fiscal_analysis.R` caused the district composite rates in `out.TAXDATA` to be ~14× too large.
+
+**Bug 1 — Unit NAV vs district NAV (steps 3 & 4):**
+
+The original step 3 aggregated parcel `NetAV` by `StateDistrict` (district-level). This district NAV was then used in step 6 as the denominator in `levy / NAV * 100` to compute the unit fund rate. But `Certified Levy` in BUDGETDATA is a unit-total levy (across all districts that unit covers). Dividing a unit-level levy by a district-level NAV inflates the rate by roughly `(unit NAV / district NAV)` — the number of districts the unit spans — for every row. Summing inflated rates across all units in a district produced a composite rate ~14× too large.
+
+**Fix:** Steps 3 and 4 rewritten to compute unit-level NAV:
+
+- Step 3: build `dist_unit_map` = unique (CNTY_CD, UNIT_TYPE_CD, TAX_DIST_CD, UNIT_CD) from xwalk; merge NETAV parcels onto it by district to expand each parcel once per unit it belongs to; aggregate by CNTY_CD + UNIT_TYPE_CD + UNIT_CD → `unit_NAV`.
+- Step 4: merge `unit_NAV` onto DISTRICTRATES_f by (CNTY_CD, UNIT_TYPE_CD, UNIT_CD). Each district × unit × fund row now carries the unit's total NAV. Rate computation in step 6 is then `levy / unit_NAV * 100`, which is correct.
+
+**Bug 2 — Duplicate rows from step 6 merge:**
+
+The step 6 merge key was `(CNTY_CD, UNIT_CD, FUND_CD)` / `(County, Unit Code, Fund)`. A diagnostic check found 2 duplicate rows in Adams BUDGETDATA on this key — two units shared a `Unit Code` but had different unit types (e.g., a city and a library both coded "01"). This caused those rows to cross-join with every district the unit covered, inflating row counts and over-summing rates in step 7.
+
+**Fix:** `UNIT_TYPE_CD` / `Unit Type Code` added as a fourth merge key in step 6. The 4-column key `(CNTY_CD, UNIT_TYPE_CD, UNIT_CD, FUND_CD)` uniquely identifies each unit fund row.
+
+### Validation
+
+After re-sourcing `fiscal_analysis.R`, the Adams County district "001" composite rate is approximately correct (~1.68 $/100 AV). The sanity check `subset(results$out.TAXDATA, StateDistrict == "001")[1, "Certified Gross Tax Rate"]` is retained in the Fiscal Analysis block of `Test.R`.
+
+### Additional fixes — same session
+
+**ResidRate rounding:** `safe_rate` is now rounded to 4 decimal places immediately after computation, before assignment to `ResidRate`, `ExemptRate`, `NonExemptRate`, or use in `Certified Gross Tax Rate`. Output rates are in $/100 AV percent form (e.g. 1.348748594 → 1.3487).
+
+**`out.LocalFisc` grouping:** `UNIT_TYPE_CD` added as a `by` variable in the step 9 unit-level aggregation. Without it, units sharing a `UNIT_CD` across different unit types would be incorrectly collapsed into one row — the same root cause as the step 6 merge-key bug.
+
+**`out.UnitFund` added (step 10):** New output table added to `fiscal_analysis()` for unit × fund baseline validation. Collapses `out.BUDGETDATA` (which is district × unit × fund) to one row per unit × fund:
+
+- Computed values (`Comp_CNAV`, `Comp_CGR`, `Comp_Levy`): taken from the first row per unit × fund via `!duplicated()` — these are unit-level quantities and are constant across all district rows for a given unit × fund.
+- Summed values (`Comp_Revenue`, `Comp_Unfunded`): aggregated across all district rows for the unit × fund.
+- Submitted values (`Sub_CNAV`, `Sub_CGR`, `Sub_Levy`): merged in from the input `BUDGETDATA` for direct comparison.
+
+The return list was updated to include `out.UnitFund` as a fourth element. `Test.R` updated to extract `UnitFund_out` and print a validation summary comparing computed vs. submitted CNAV, CGR, Levy, Revenue, and Unfunded at the unit × fund level for Adams County (assessment_year 2024).
+
+### Files changed
+
+- `PTCAPS/code/fiscal_analysis.R` — steps 3, 4, 6, 9 revised; step 10 added; return list updated
+- `in_ptax/R/fiscal_analysis.R` — synced
+- `PTCAPS/code/Test.R` — diagnostic block removed; sanity check, sort, and unit × fund validation block added
+
+---
+
+## 2026-03-07 — Session 14: CNAV overestimation investigation
+
+### ⚠️ OPEN ISSUE — START HERE NEXT SESSION
+
+**The computed Certified Net Assessed Valuation (CNAV) at the unit × fund level is systematically too high compared to the submitted BUDGETDATA values.** This is the active debugging target. Investigation is incomplete; pick it up at the top of the next session.
+
+### What was found
+
+The `out.UnitFund` validation table (added in Session 13) confirmed the overestimation: the model's computed CNAV exceeds the submitted CNAV for most units in Adams County. The computed CNAV flows from `netav_taxbill()` → district-level aggregate → unit-level aggregate via the xwalk.
+
+### Validation tests written to Test.R
+
+Three standalone validation blocks were added to `PTCAPS/code/Test.R` to isolate where the error enters:
+
+**Block 1 — `netav_taxbill` validation:** Confirmed working correctly. The computed `NetAV` from `netav_taxbill(TAXDATA, ADJMENTS)` matches the reported `NetAV` in TAXDATA on all non-NA parcels (exact match). The problem is not in the deduction/exemption calculation.
+
+**Block 2 — District → Unit CNAV validation:** Aggregates reported `NetAV` from TAXDATA to the district level, then to the unit level via `xwalk.Adams` (mirroring `fiscal_analysis()` steps 3–4), and compares against submitted CNAV in BUDGETDATA. Confirmed the overestimation: computed CNAV > submitted CNAV at the unit level.
+
+**Block 3 — Candidate AV columns:** `AV_TIF` (TIF increment AV) and `AVPPLocal` (local personal property AV) were rolled up through the same district → unit path and reported alongside `diff` in the mismatch table. Residuals computed:
+- `diff_less_TIF` = diff − AV_TIF
+- `diff_less_PP` = diff − AVPPLocal
+- `diff_less_TIF_PP` = diff − AV_TIF − AVPPLocal
+
+### Hypotheses for next session
+
+Neither `AV_TIF` alone nor `AVPPLocal` alone fully explains the gap. Two leading candidates remain:
+
+1. **TIF increment AV (`AV_TIF`):** The submitted CNAV in BUDGETDATA likely excludes TIF increment AV (the increment above the base is captured by the TIF district, not the overlapping taxing units). If the TAXDATA `NetAV` field includes TIF increment AV, our district → unit roll-up would overstate the units' CNAV by exactly `AV_TIF`.
+
+2. **Business Personal Property (`AVPPLocal`, `AVPPState`):** Personal property AV may be handled differently in the BUDGETDATA CNAV certification. Consider also checking `AVPPState` (state-assessed personal property).
+
+**Suggested first steps:**
+- Print the ratio `diff / Unit_AV_TIF` per unit — if consistently near 1.0, TIF is the full explanation
+- Check whether `NetAV` in TAXDATA already has TIF increment subtracted (look at parcels with `AV_TIF > 0` and compare `GrossAV − NetAV` vs. `TotalDeductions + TotalExemptions + AV_TIF`)
+- Try computing `Calc_CNAV` as `sum(NetAV − AV_TIF)` at district level before rolling to unit level and compare against submitted CNAV
+
+### Files changed
+
+- `PTCAPS/code/Test.R` — three validation blocks added (netav_taxbill, district→unit CNAV, AV_TIF + AVPPLocal candidates)
+- `in_ptax/quality_reports/session_logs/lab_journal.md` — this entry
