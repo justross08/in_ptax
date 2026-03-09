@@ -95,32 +95,65 @@ fiscal_analysis <- function(county, assessment_year,
   drop_drf <- c("CERTD_TAX_RATE_PCNT", "ResidRate", "ExemptRate", "NonExemptRate")
   DISTRICTRATES_f <- DISTRICTRATES_f[, !names(DISTRICTRATES_f) %in% drop_drf]
 
-  # ── Step 3: unit_NAV ───────────────────────────────────────────────────────
-  # Sum parcel NetAV to the unit level. Each parcel belongs to one district;
-  # each district overlaps multiple units. Expand via the xwalk (deduplicated
-  # to district × unit) to assign parcels to their units, then aggregate by
-  # CNTY_CD + UNIT_TYPE_CD + UNIT_CD. This is the correct denominator for the
-  # rate formula (levy / unit_NAV), since certified levies in BUDGETDATA are
-  # unit-totals, not district-level amounts.
-  dist_unit_map <- unique(xwalk[, c("CNTY_CD", "UNIT_TYPE_CD", "TAX_DIST_CD", "UNIT_CD")])
-  netav_by_unit <- merge(
-    NETAV[, c("StateDistrict", "NetAV")],
-    dist_unit_map,
-    by.x = "StateDistrict", by.y = "TAX_DIST_CD",
-    all.x = FALSE
-  )
-  unit_NAV <- aggregate(NetAV ~ CNTY_CD + UNIT_TYPE_CD + UNIT_CD,
-                        data = netav_by_unit, FUN = sum, na.rm = TRUE)
-  names(unit_NAV)[names(unit_NAV) == "NetAV"] <- "Certified Net Assessed Valuation"
+  # ── Steps 3-4: NewAV_by_fund ───────────────────────────────────────────────
+  # Goal: one row per TAX_DIST_CD × UNIT_TYPE_CD × UNIT_CD × FUND_CD, each
+  # carrying that unit's total NAV (summed across all districts it covers).
+  # Unit-level NAV is the correct denominator for levy / NAV * 100 because
+  # certified levies in BUDGETDATA are unit-totals, not district amounts.
+  #
+  # Three sub-steps make the aggregation path explicit:
+  #   3a. Aggregate parcel NAV (NetAV − AV_TIF) to district level. TIF increment
+  #       AV is excluded because units set rates on TIF-net CNAV. Taxpayers pay
+  #       on full NetAV; the TIF portion of each bill is captured by the TIF
+  #       district fund, not by the taxing units.
+  #   3b. Fan district NAV out to every district × unit × fund row in the
+  #       crosswalk (1:many merge; one district NAV → multiple unit×fund rows).
+  #   3c. Sum district NAVs within each unit × fund → unit-level NAV.
+  #       Grouping by FUND_CD is redundant (NAV is the same for all funds of a
+  #       unit) but keeps the key structure consistent with DISTRICTRATES_f.
+  #
+  # Step 4 re-merges the lean unit × fund NAV table back onto the full
+  # district × unit × fund crosswalk, restoring TAX_DIST_CD for the downstream
+  # rate aggregation (step 7) and revenue allocation (steps 8-9).
 
-  # ── Step 4: NewAV_by_fund ──────────────────────────────────────────────────
-  # Attach new unit-level NAV to every district × unit × fund row in the
-  # crosswalk. Merge key is CNTY_CD + UNIT_TYPE_CD + UNIT_CD; TAX_DIST_CD is
-  # already in DISTRICTRATES_f and is preserved in the output.
-  # Result has one row per TAX_DIST_CD × UNIT_TYPE_CD × UNIT_CD × FUND_CD.
+  # 3a: District-level NAV excluding TIF increment
+  # AV_TIF is in TAXDATA but not in NETAV; join it at the parcel level first.
+  netav_tif <- merge(
+    NETAV[, c("ParcelNum", "StateDistrict", "NetAV")],
+    TAXDATA[, c("ParcelNum", "AV_TIF")],
+    by = "ParcelNum", all.x = TRUE
+  )
+  netav_tif$AV_TIF       <- ifelse(is.na(netav_tif$AV_TIF), 0, netav_tif$AV_TIF)
+  netav_tif$NAV_excl_TIF <- pmax(netav_tif$NetAV - netav_tif$AV_TIF, 0)
+
+  NewAV_by_district <- aggregate(
+    NAV_excl_TIF ~ StateDistrict,
+    data = netav_tif,
+    FUN  = sum, na.rm = TRUE
+  )
+  names(NewAV_by_district)[2] <- "District_NAV"
+
+  # 3b: Fan district NAV out to district × unit × fund rows
+  NewAV_expanded <- merge(
+    DISTRICTRATES_f, NewAV_by_district,
+    by.x  = "TAX_DIST_CD", by.y = "StateDistrict",
+    all.x = TRUE
+  )
+
+  # 3c: Sum district NAVs within each unit × fund → unit-level NAV
+  NewAV_by_fund <- aggregate(
+    District_NAV ~ CNTY_CD + UNIT_TYPE_CD + UNIT_CD + FUND_CD,
+    data = NewAV_expanded,
+    FUN  = sum, na.rm = TRUE
+  )
+  names(NewAV_by_fund)[names(NewAV_by_fund) == "District_NAV"] <- "Certified Net Assessed Valuation"
+
+  # Step 4: Re-attach unit NAV to the full district × unit × fund crosswalk.
+  # Merge key includes FUND_CD so each district row gets its unit's NAV.
+  # TAX_DIST_CD is preserved from DISTRICTRATES_f for all downstream steps.
   NewAV_by_fund <- merge(
-    DISTRICTRATES_f, unit_NAV,
-    by  = c("CNTY_CD", "UNIT_TYPE_CD", "UNIT_CD"),
+    DISTRICTRATES_f, NewAV_by_fund,
+    by    = c("CNTY_CD", "UNIT_TYPE_CD", "UNIT_CD", "FUND_CD"),
     all.x = TRUE
   )
 
@@ -232,11 +265,27 @@ fiscal_analysis <- function(county, assessment_year,
   TAXDATA2$ActualNonExemptBill <- TAXDATA2$NetBill - TAXDATA2$SuppHTRC - TAXDATA2$TotalCredits
   TAXDATA2$ActualBill          <- TAXDATA2$ActualNonExemptBill + TAXDATA2$ExemptGrossBill
 
+  # TIF revenue split.
+  # Credits and SuppHTRC are already applied above; both the TIF fund and the
+  # taxing units share the post-credit bill proportionally by AV_TIF / NetAV.
+  # Guard against NetAV = 0 or AV_TIF > NetAV (data anomalies).
+  tif_frac <- ifelse(!is.na(TAXDATA2$NetAV) & TAXDATA2$NetAV > 0,
+                     TAXDATA2$AV_TIF / TAXDATA2$NetAV, 0)
+  tif_frac <- pmin(tif_frac, 1)
+
+  TAXDATA2$TIF_ActualBill    <- TAXDATA2$ActualNonExemptBill * tif_frac
+  TAXDATA2$NonTIF_ActualBill <- TAXDATA2$ActualNonExemptBill - TAXDATA2$TIF_ActualBill
+  TAXDATA2$TIF_ExemptBill    <- TAXDATA2$ExemptGrossBill     * tif_frac
+  TAXDATA2$NonTIF_ExemptBill <- TAXDATA2$ExemptGrossBill     - TAXDATA2$TIF_ExemptBill
+
   out.TAXDATA <- TAXDATA2
 
   # Aggregate bill variables to district level for revenue allocation in step 9.
   bill_vars <- c("GrossTaxBill", "NonExemptGrossBill", "ExemptGrossBill",
-                 "NetBill", "PTCLoss", "SuppHTRC", "ActualNonExemptBill", "ActualBill")
+                 "NetBill", "PTCLoss", "SuppHTRC",
+                 "ActualNonExemptBill", "ActualBill",
+                 "TIF_ActualBill", "NonTIF_ActualBill",
+                 "TIF_ExemptBill",    "NonTIF_ExemptBill")
   aggTaxBills <- aggregate(
     out.TAXDATA[, bill_vars],
     by  = list(TAX_DIST_CD = out.TAXDATA$StateDistrict),
@@ -276,12 +325,14 @@ fiscal_analysis <- function(county, assessment_year,
   out.BUDGETDATA <- merge(LocalFisc_Fund2, aggTaxBills, by = "TAX_DIST_CD")
 
   # Revenue: distribute district bill totals across funds by rate share.
-  #   Cap-exempt funds (ExemptFund = 1): share of total exempt gross bill.
-  #   Non-exempt funds (NonExemptFund = 1): share of total actual non-exempt bill.
+  # Only the non-TIF portions flow to taxing units; the TIF portion is captured
+  # by the TIF district fund and reported separately in out.TIFRevenue.
+  #   Cap-exempt funds (ExemptFund = 1): share of non-TIF exempt gross bill.
+  #   Non-exempt funds (NonExemptFund = 1): share of non-TIF actual non-exempt bill.
   out.BUDGETDATA$Revenue <- ifelse(
     out.BUDGETDATA$ExemptFund == 1,
-    out.BUDGETDATA$shr_ExemptRate    * out.BUDGETDATA$`sum.ExemptGrossBill`,
-    out.BUDGETDATA$shr_NonExemptRate * out.BUDGETDATA$`sum.ActualNonExemptBill`
+    out.BUDGETDATA$shr_ExemptRate    * out.BUDGETDATA$`sum.NonTIF_ExemptBill`,
+    out.BUDGETDATA$shr_NonExemptRate * out.BUDGETDATA$`sum.NonTIF_ActualBill`
   )
 
   # Unfunded: shortfall between certified levy and revenue, for non-exempt funds.
@@ -302,7 +353,28 @@ fiscal_analysis <- function(county, assessment_year,
     FUN = sum, na.rm = TRUE
   )
 
-  # ── Step 10: out.UnitFund — unit × fund validation table ──────────────────
+  # ── Step 10: out.TIFRevenue — TIF district fund revenue ───────────────────
+  # TIF revenue is captured at the tax district level; it does not flow to
+  # taxing units. One row per tax district (only districts with TIF AV will
+  # have non-zero totals). UNIT_TYPE_CD = "99" is a sentinel distinguishing
+  # TIF entries from real unit types (1–7) when merged with out.BUDGETDATA.
+  dist_county <- unique(xwalk[, c("TAX_DIST_CD", "CNTY_CD")])
+
+  out.TIFRevenue <- merge(
+    data.frame(
+      TAX_DIST_CD   = aggTaxBills$TAX_DIST_CD,
+      UNIT_TYPE_CD  = "99",
+      TIF_NonExempt = aggTaxBills$`sum.TIF_ActualBill`,
+      TIF_Exempt    = aggTaxBills$`sum.TIF_ExemptBill`,
+      TIF_Total     = aggTaxBills$`sum.TIF_ActualBill` + aggTaxBills$`sum.TIF_ExemptBill`
+    ),
+    dist_county,
+    by = "TAX_DIST_CD", all.x = TRUE
+  )
+  out.TIFRevenue <- out.TIFRevenue[, c("CNTY_CD", "TAX_DIST_CD", "UNIT_TYPE_CD",
+                                        "TIF_NonExempt", "TIF_Exempt", "TIF_Total")]
+
+  # ── Step 11: out.UnitFund — unit × fund validation table ──────────────────
   # Collapses out.BUDGETDATA from district × unit × fund to unit × fund and
   # merges in the submitted input BUDGETDATA values for side-by-side comparison.
   #
@@ -358,6 +430,7 @@ fiscal_analysis <- function(county, assessment_year,
     out.TAXDATA    = out.TAXDATA,
     out.BUDGETDATA = out.BUDGETDATA,
     out.LocalFisc  = out.LocalFisc,
+    out.TIFRevenue = out.TIFRevenue,
     out.UnitFund   = out.UnitFund
   )
 }
