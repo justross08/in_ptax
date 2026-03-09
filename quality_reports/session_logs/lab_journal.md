@@ -658,3 +658,18 @@ CNAV overestimation reduced but not fully eliminated. TIF increment AV was clear
 - `PTCAPS/code/fiscal_analysis_backup_20260308_v2.R` — backup after refactor, before TIF
 - `in_ptax/quality_reports/session_logs/lab_journal.md` — this entry
 - `in_ptax/README.md` — updated to reflect new output and pipeline changes
+
+---
+
+## ⚠️ OPEN ISSUE — START HERE NEXT SESSION
+
+**The `Unfunded` (unfunded liability) figures in `out.UnitFund` / `out.LocalFisc` are many orders of magnitude too large.**
+
+`Unfunded` should approximately equal `Certified Levy − Revenue` for each unit — the difference between what the unit was certified to collect and what the model says it actually collected. Instead the values are wildly inflated, indicating a bug in the allocation or aggregation steps that produces `Unfunded`.
+
+**Likely places to investigate:**
+
+1. **How `Unfunded` is computed** — check the formula in `fiscal_analysis.R` (steps 9–11). Confirm the subtraction is `Sub_Levy − Revenue` and that both are in the same units (dollars). A scaling error (e.g. one side still in raw integers × 100) would produce the observed magnitude.
+2. **`Revenue` aggregation** — verify that `Revenue` at the unit × fund level in `out.UnitFund` is the sum over all districts (not a single district row). If `Revenue` is being compared against a unit-level `Sub_Levy` but was only partially aggregated, the difference would be overstated.
+3. **`Sub_Levy` source** — confirm the certified levy column pulled from `BUDGETDATA` has the correct implied decimal applied (Format 12.2; divide by 100 at import). If `Sub_Levy` is still raw (×100 too large) while `Revenue` is in dollars, `Unfunded = Sub_Levy − Revenue` would be approximately `99 × Revenue`.
+4. **Unit vs. fund level** — check whether the comparison is accidentally at fund level in one place and unit level in another.
