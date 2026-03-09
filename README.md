@@ -67,7 +67,7 @@ in_ptax/
 ### Simulation pipeline
 
 - **`netav_taxbill(TAXDATA, ADJMENTS)`** — computes parcel-level net assessed value from TAXDATA and ADJMENTS. Zeros circuit-breaker credits (AdjstCodes 61–63), aggregates type C credits, type D deductions, and type E exemptions by parcel. Returns `ParcelNum`, `StateDistrict`, `GrossAV`, `TotalCredits`, `TotalDeductions`, `TotalExemptions`, `NetAV` (= GrossAV − deductions − exemptions).
-- **`fiscal_analysis(county, assessment_year, TAXDATA, ADJMENTS, BUDGETDATA, xwalk, FRF, CapExempt)`** — workhorse simulation function. Returns a named list: `out.TAXDATA` (parcel-level bills including GrossTaxBill, NetBill, PTCLoss, SuppHTRC, ActualBill), `out.BUDGETDATA` (fund-level revenue allocation), `out.LocalFisc` (unit-level Revenue and Unfunded summary). Use `county = 0` for all counties.
+- **`fiscal_analysis(county, assessment_year, TAXDATA, ADJMENTS, BUDGETDATA, xwalk, FRF, CapExempt)`** — workhorse simulation function. Returns a named list with five outputs: `out.TAXDATA` (parcel-level bills including GrossTaxBill, NetBill, PTCLoss, SuppHTRC, ActualBill, and TIF bill split columns), `out.BUDGETDATA` (fund-level revenue allocation, using non-TIF bill totals), `out.LocalFisc` (unit-level Revenue and Unfunded summary), `out.TIFRevenue` (district-level TIF fund revenue with `UNIT_TYPE_CD = "99"` sentinel), and `out.UnitFund` (unit × fund baseline validation table). Use `county = 0` for all counties.
 
 ### Policy simulation
 
@@ -80,6 +80,8 @@ in_ptax/
 **ADJMENTS records:** Each parcel may have multiple adjustment records. Adjustment type codes (C/E/D) and adjustment codes (List 37 in the PTMS manual) identify the specific deduction, exemption, or credit. The homestead standard deduction (AdjstCode "3") and supplemental deduction (AdjstCode "64") together define the homestead benefit.
 
 **Tax districts:** A tax district is a unique combination of overlapping local governments within a county. Every parcel falls in exactly one tax district, and its `LocalTaxRate` equals the sum of all unit-fund rates for that district. `district_rates()` reconstructs this composite rate from the crosswalk.
+
+**TIF increment AV:** `AV_TIF` in TAXDATA is the assessed value increment above the TIF base for parcels in a TIF district. This increment is excluded from the Certified Net Assessed Valuation (CNAV) used by taxing units for rate-setting — units set their levies against NAV net of TIF increment. However, taxpayers pay on the full `NetAV` (including TIF increment). The portion of each bill attributable to `AV_TIF / NetAV` flows to a TIF district fund and is reported in `out.TIFRevenue`; only the non-TIF portion flows to taxing unit revenues.
 
 **Baseline validation:** Before running policy simulations, aggregate computed bills are reconciled against certified levy totals by county and taxing unit to confirm the pipeline is internally consistent.
 

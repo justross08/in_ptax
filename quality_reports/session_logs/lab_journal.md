@@ -543,3 +543,118 @@ Neither `AV_TIF` alone nor `AVPPLocal` alone fully explains the gap. Two leading
 
 - `PTCAPS/code/Test.R` — three validation blocks added (netav_taxbill, district→unit CNAV, AV_TIF + AVPPLocal candidates)
 - `in_ptax/quality_reports/session_logs/lab_journal.md` — this entry
+
+---
+
+## 2026-03-08 — Session 15: Steps 3–4 refactor + TIF mechanism implementation
+
+### Summary
+
+Two major changes to `fiscal_analysis.R`:
+
+1. **Transparency refactor of steps 3–4** — the district→unit NAV aggregation path was restructured into explicit sub-steps without numerical change.
+2. **TIF mechanism implementation** — corrected CNAV computation to exclude AV_TIF; added parcel-level TIF bill split; routed TIF revenue to a new output table.
+
+The CNAV overestimation is reduced but not fully eliminated. Remaining gap is consistent with a portion of CNAV differences that are not explained by AV_TIF alone. TIF was clearly a significant contributor; investigation continues.
+
+---
+
+### Change 1 — Steps 3–4 transparency refactor
+
+**Motivation:** The previous code aggregated NETAV directly to unit×fund level, which obscured the district→unit fan-out. The user requested an explicit intermediate district-level step to make the logic readable.
+
+**Before:** Steps 3–4 directly merged `unit_NAV` (aggregated from `NETAV` by district×unit×fund) with `BUDGETDATA`-derived unit look-ups via a `dist_unit_map` intermediate.
+
+**After:** Three explicit sub-steps:
+- **3a:** Aggregate `NETAV` (parcel-level) by `StateDistrict` → `NewAV_by_district` (one row per district, `District_NAV` column). *Note: step 3a was subsequently modified in Change 2 to aggregate `NAV_excl_TIF` instead of raw `NetAV`.*
+- **3b:** Merge `DISTRICTRATES_f` with `NewAV_by_district` on `TAX_DIST_CD` → `NewAV_expanded` (district×unit×fund rows each carrying their district's total NAV). This is a 1:many fan-out; not a 1:1 merge.
+- **3c:** Aggregate `District_NAV` by `CNTY_CD + UNIT_TYPE_CD + UNIT_CD + FUND_CD` → `NewAV_by_fund` (one row per unit×fund). Rename `District_NAV` → `"Certified Net Assessed Valuation"`.
+- **Step 4:** Re-merge `DISTRICTRATES_f` with `NewAV_by_fund` on `(CNTY_CD, UNIT_TYPE_CD, UNIT_CD, FUND_CD)` → restores `TAX_DIST_CD` for steps 7–9. This step was required because collapsing to unit×fund in step 3c drops `TAX_DIST_CD`, which is needed later for district-level aggregation.
+
+**Eliminated:** `dist_unit_map`, `netav_by_unit`, `unit_NAV` intermediate objects.
+
+Backed up pre-refactor state as `fiscal_analysis_backup_20260308.R`. Backed up post-refactor (pre-TIF) state as `fiscal_analysis_backup_20260308_v2.R`.
+
+---
+
+### Change 2 — TIF mechanism
+
+**Background (confirmed by user):**
+
+1. CNAV for rate-setting **excludes** `AV_TIF`. Units submit certified levies; the state divides by NAV *net of TIF increment* to derive the tax rate. The `AV_TIF` field in TAXDATA is the increment AV above the TIF base.
+2. Taxpayers pay on their full `NetAV` (including TIF increment). The higher rate (set on a smaller CNAV base) is applied to the full NAV.
+3. The portion of each bill attributable to `AV_TIF` flows to a TIF district fund, not to the overlapping taxing units.
+4. Credits and `SuppHTRC` reduce total bills **before** the TIF split. Both the TIF fund and taxing units share the credit reduction proportionally.
+
+**Step 3a — CNAV excludes AV_TIF:**
+
+Before aggregating by district, `AV_TIF` is joined from `TAXDATA` onto `NETAV` at the parcel level. `NAV_excl_TIF = pmax(NetAV - AV_TIF, 0)` is computed, and `District_NAV` is now the district-level sum of `NAV_excl_TIF`. This directly corrects the CNAV overestimation.
+
+**Step 7 — Parcel-level TIF bill split:**
+
+After `ActualNonExemptBill` and `ActualBill` are computed (unchanged), four new columns are added:
+
+```r
+tif_frac <- ifelse(!is.na(TAXDATA2$NetAV) & TAXDATA2$NetAV > 0,
+                   TAXDATA2$AV_TIF / TAXDATA2$NetAV, 0)
+tif_frac <- pmin(tif_frac, 1)
+
+TAXDATA2$TIF_ActualBill    <- TAXDATA2$ActualNonExemptBill * tif_frac
+TAXDATA2$NonTIF_ActualBill <- TAXDATA2$ActualNonExemptBill - TAXDATA2$TIF_ActualBill
+TAXDATA2$TIF_ExemptBill    <- TAXDATA2$ExemptGrossBill     * tif_frac
+TAXDATA2$NonTIF_ExemptBill <- TAXDATA2$ExemptGrossBill     - TAXDATA2$TIF_ExemptBill
+```
+
+All four added to `bill_vars` so they aggregate to district level in step 8.
+
+**Step 9 — Revenue formula uses non-TIF bills:**
+
+```r
+out.BUDGETDATA$Revenue <- ifelse(
+  out.BUDGETDATA$ExemptFund == 1,
+  out.BUDGETDATA$shr_ExemptRate    * out.BUDGETDATA$`sum.NonTIF_ExemptBill`,
+  out.BUDGETDATA$shr_NonExemptRate * out.BUDGETDATA$`sum.NonTIF_ActualBill`
+)
+```
+
+**Step 10 (new) — `out.TIFRevenue`:**
+
+District-level TIF revenue table. `UNIT_TYPE_CD = "99"` sentinel is assigned so rows can be safely merged with `out.BUDGETDATA` without colliding with real unit type codes (1–7). County code is attached from the crosswalk:
+
+```r
+dist_county   <- unique(xwalk[, c("TAX_DIST_CD", "CNTY_CD")])
+out.TIFRevenue <- merge(
+  data.frame(
+    TAX_DIST_CD   = aggTaxBills$TAX_DIST_CD,
+    UNIT_TYPE_CD  = "99",
+    TIF_NonExempt = aggTaxBills$`sum.TIF_ActualBill`,
+    TIF_Exempt    = aggTaxBills$`sum.TIF_ExemptBill`,
+    TIF_Total     = aggTaxBills$`sum.TIF_ActualBill` + aggTaxBills$`sum.TIF_ExemptBill`
+  ),
+  dist_county, by = "TAX_DIST_CD", all.x = TRUE
+)
+out.TIFRevenue <- out.TIFRevenue[, c("CNTY_CD", "TAX_DIST_CD", "UNIT_TYPE_CD",
+                                      "TIF_NonExempt", "TIF_Exempt", "TIF_Total")]
+```
+
+**Return list** updated to five outputs: `out.TAXDATA`, `out.BUDGETDATA`, `out.LocalFisc`, `out.TIFRevenue`, `out.UnitFund`.
+
+**Step 11** (previously step 10) — `out.UnitFund` — label updated in comments only.
+
+---
+
+### Status after session
+
+CNAV overestimation reduced but not fully eliminated. TIF increment AV was clearly a meaningful contributor. Residuals are smaller; further investigation pending (possible role of `AVPPLocal`, `AVPPState`, or unit-specific CNAV adjustments in BUDGETDATA).
+
+---
+
+### Files changed
+
+- `PTCAPS/code/fiscal_analysis.R` — steps 3–4 refactored; step 3a CNAV fix; step 7 TIF split; step 9 revenue formula; step 10 `out.TIFRevenue` added; return list updated (5 outputs)
+- `in_ptax/R/fiscal_analysis.R` — synced (commit `b5ee49c`)
+- `PTCAPS/code/Test.R` — `TIFRevenue_out` extraction added
+- `PTCAPS/code/fiscal_analysis_backup_20260308.R` — backup before refactor
+- `PTCAPS/code/fiscal_analysis_backup_20260308_v2.R` — backup after refactor, before TIF
+- `in_ptax/quality_reports/session_logs/lab_journal.md` — this entry
+- `in_ptax/README.md` — updated to reflect new output and pipeline changes
